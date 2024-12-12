@@ -1,0 +1,11 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch
+transformers
+accelerate
+optimum
+auto-gptq
+qwen_vl_utils
+fastapi
+uvicorn
+pydantic
+jinja2
