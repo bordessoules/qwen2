@@ -1,51 +1,91 @@
 import torch
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
 from qwen_vl_utils import process_vision_info
-from config import MODEL_CONFIG
+from config import MODEL_CONFIG, QUANT_CONFIGS
 import argparse
+import gc
+
+
+
+def load_model(config):
+    model_name = config["model_name"]
+    precision = config["precision"]
+    hf_token = config["hf_token"]
+    device_map = config["device_map"]
+    attn_impl = "flash_attention_2" if config.get("use_flash_attention") else "eager"
+
+    if precision == "8bit":
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            bnb_8bit_use_double_quant=True,
+            bnb_8bit_compute_dtype=torch.float16
+        )
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_name,
+            device_map=device_map,
+            attn_implementation=attn_impl,
+            quantization_config=quantization_config
+        )
+    elif precision == "bfloat16":
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_name,
+            device_map=device_map,
+            attn_implementation=attn_impl,
+            torch_dtype=torch.bfloat16
+        )
+    elif precision in QUANT_CONFIGS:
+        quantized_name = f"{model_name}{QUANT_CONFIGS[precision]['model_name_suffix']}"
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            quantized_name,
+            device_map=device_map,
+            attn_implementation=attn_impl,
+            token=hf_token,
+            **QUANT_CONFIGS[precision]
+        )
+    
+    return model
 
 def main():
-    # Set up argument parser
     parser = argparse.ArgumentParser(description="Run Qwen2VL model with configurable settings.")
+    parser.add_argument('--hf_token', default=MODEL_CONFIG["hf_token"], type=str, help='Hugging Face auth token')
     parser.add_argument('--model', type=str, default=MODEL_CONFIG["model_name"], help='Model name to use')
+    parser.add_argument('--precision', type=str, default=MODEL_CONFIG["precision"], help='Precision mode')
     parser.add_argument('--minpixels', type=int, default=MODEL_CONFIG["min_pixels"], help='Minimum pixels for processing')
     parser.add_argument('--maxpixels', type=int, default=MODEL_CONFIG["max_pixels"], help='Maximum pixels for processing')
     parser.add_argument('--maxtokens', type=int, default=MODEL_CONFIG["max_new_tokens"], help='Maximum number of tokens to generate')
     parser.add_argument('prompt', type=str, help='Text prompt for the model')
-    parser.add_argument('images', nargs='*', help='Paths to image files')
+    parser.add_argument('images', nargs='+', help='Paths to image files')
     args = parser.parse_args()
 
-    # Load model and processor
-    print(f"Loading model: {args.model}...")
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
-        args.model,
-        device_map="auto"
-    )
-    processor = AutoProcessor.from_pretrained(
-        args.model,
-        min_pixels=args.minpixels,
-        max_pixels=args.maxpixels
-    )
-    print(f"Model {args.model} loaded successfully")
+    config = MODEL_CONFIG.copy()
+    config["model_name"] = args.model
+    config["precision"] = args.precision
 
-    # Process input
-    messages = [{"role": "user", "content": [{"type": "text", "text": args.prompt}]}]
+    print(f"Loading model: {config['model_name']} with precision {config['precision']}...")
+    model = load_model(config)
+    processor = AutoProcessor.from_pretrained(args.model)
+    print("Model loaded successfully")
+
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": args.prompt}
+        ] + [{"type": "image", "image": img} for img in args.images]
+    }]
+
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    
-    # Load images
-    image_inputs, video_inputs = process_vision_info(args.images)
+    image_inputs, video_inputs = process_vision_info(messages)
 
     inputs = processor(
-        text=[text],
+        text=text,
         images=image_inputs,
         videos=video_inputs,
         padding=True,
         return_tensors="pt"
-    ).to("cuda")
+    ).to(model.device)
 
-    # Generate response
     print("Generating response...")
-    generated_ids = model.generate(
+    outputs = model.generate(
         **inputs,
         max_new_tokens=args.maxtokens,
         do_sample=True,
@@ -53,18 +93,13 @@ def main():
         top_p=0.9
     )
 
-    generated_ids_trimmed = [
-        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
+    response = processor.decode(outputs[0], skip_special_tokens=True)
+    print("Response:", response)
 
-    output_text = processor.batch_decode(
-        generated_ids_trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False
-    )
-
-    # Output the generated text
-    print("Response:", output_text[0])
+    del model, outputs
+    torch.cuda.empty_cache()
+    del processor  # Also clear the processor
+    gc.collect()   # Force garbage collection
 
 if __name__ == "__main__":
     main()

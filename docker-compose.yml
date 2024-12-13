@@ -1,0 +1,19 @@
+services:
+  qwen2vl:
+    build: .
+    volumes:
+      - .:/app
+      - ./images:/images
+      - model_cache:/root/.cache/huggingface  # Persistent cache for models
+    environment:
+      - HF_AUTH_TOKEN=<your_huggingface_token>  # Add this line
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  model_cache:  # Define the named volume
